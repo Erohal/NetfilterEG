@@ -17,7 +17,7 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Init ENV
-      run: apt-fast install -y libnfnetlink-dev
+      run: apt-fast install -y libnfnetlink-dev libmnl-dev libnetfilter-queue-dev
     
     - name: Install libs
       run: |
@@ -25,6 +25,7 @@ jobs:
         ./configure && make && make install
         cd ${{github.workspace}}/libs/libmnl-1.0.4
         ./configure && make && make install
+        apt remove -y libmnl-dev libnetfilter-queue-dev
       
     - name: Configure CMake
       run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
