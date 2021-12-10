@@ -22,9 +22,9 @@ jobs:
     - name: Install libs
       run: |
         cd ${{github.workspace}}/libs/libnetfilter_queue-1.0.5
-        ./configure && make && make install
+        ./configure && make && sudo -E make install
         cd ${{github.workspace}}/libs/libmnl-1.0.4
-        ./configure && make && make install
+        ./configure && make && sudo -E make install
         apt remove -y libmnl-dev libnetfilter-queue-dev
       
     - name: Configure CMake
