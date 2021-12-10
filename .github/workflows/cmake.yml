@@ -21,9 +21,9 @@ jobs:
     
     - name: Install libs
       run: |
-        cd NetfilterEG/libs/libnetfilter_queue-1.0.5
+        cd ${{github.workspace}}/libs/libnetfilter_queue-1.0.5
         ./configure && make && make install
-        cd ../libmnl-1.0.4
+        cd ${{github.workspace}}/libs/libmnl-1.0.4
         ./configure && make && make install
       
     - name: Configure CMake
