@@ -7,4 +7,5 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 aux_source_directory(src DIR_SRCS)
 add_executable(NetfilterEG ${DIR_SRCS})
+
 target_link_libraries(NetfilterEG mnl netfilter_queue)

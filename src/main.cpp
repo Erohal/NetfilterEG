@@ -1,4 +1,4 @@
-/* This example is placed in the public domain. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,156 +9,104 @@
 #include <libmnl/libmnl.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nfnetlink.h>
+
+#include <linux/types.h>
 #include <linux/netfilter/nfnetlink_queue.h>
 
-static int parse_attr_cb(const struct nlattr *attr, void *data)
+#include <libnetfilter_queue/libnetfilter_queue.h>
+
+/* NFQA_CT requires CTA_* attributes defined in nfnetlink_conntrack.h */
+#include <linux/netfilter/nfnetlink_conntrack.h>
+
+static struct mnl_socket *nl;
+
+static void
+nfq_send_verdict(int queue_num, uint32_t id)
 {
-    const struct nlattr **tb = static_cast<const struct nlattr**>(data);
-	int type = mnl_attr_get_type(attr);
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct nlmsghdr *nlh;
+	struct nlattr *nest;
 
-	/* skip unsupported attribute in user-space */
-	if (mnl_attr_type_valid(attr, NFQA_MAX) < 0)
-		return MNL_CB_OK;
+	nlh = nfq_nlmsg_put(buf, NFQNL_MSG_VERDICT, queue_num);
+	nfq_nlmsg_verdict_put(nlh, id, NF_ACCEPT);
 
-	switch(type) {
-	case NFQA_MARK:
-	case NFQA_IFINDEX_INDEV:
-	case NFQA_IFINDEX_OUTDEV:
-	case NFQA_IFINDEX_PHYSINDEV:
-	case NFQA_IFINDEX_PHYSOUTDEV:
-		if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
-			perror("mnl_attr_validate");
-			return MNL_CB_ERROR;
-		}
-		break;
-	case NFQA_TIMESTAMP:
-		if (mnl_attr_validate2(attr, MNL_TYPE_UNSPEC,
-		    sizeof(struct nfqnl_msg_packet_timestamp)) < 0) {
-			perror("mnl_attr_validate2");
-			return MNL_CB_ERROR;
-		}
-		break;
-	case NFQA_HWADDR:
-		if (mnl_attr_validate2(attr, MNL_TYPE_UNSPEC,
-		    sizeof(struct nfqnl_msg_packet_hw)) < 0) {
-			perror("mnl_attr_validate2");
-			return MNL_CB_ERROR;
-		}
-		break;
-	case NFQA_PAYLOAD:
-		break;
+	/* example to set the connmark. First, start NFQA_CT section: */
+	nest = mnl_attr_nest_start(nlh, NFQA_CT);
+
+	/* then, add the connmark attribute: */
+	mnl_attr_put_u32(nlh, CTA_MARK, htonl(42));
+	/* more conntrack attributes, e.g. CTA_LABELS could be set here */
+
+	/* end conntrack section */
+	mnl_attr_nest_end(nlh, nest);
+
+	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
+		perror("mnl_socket_send");
+		exit(EXIT_FAILURE);
 	}
-	tb[type] = attr;
-	return MNL_CB_OK;
 }
 
 static int queue_cb(const struct nlmsghdr *nlh, void *data)
 {
-	struct nlattr *tb[NFQA_MAX+1] = {};
 	struct nfqnl_msg_packet_hdr *ph = NULL;
-	uint32_t id = 0;
+	struct nlattr *attr[NFQA_MAX+1] = {};
+	uint32_t id = 0, skbinfo;
+	struct nfgenmsg *nfg;
+	uint16_t plen;
 
-	mnl_attr_parse(nlh, sizeof(struct nfgenmsg), parse_attr_cb, tb);
-	if (tb[NFQA_PACKET_HDR]) {
-		ph = static_cast<struct nfqnl_msg_packet_hdr *>(mnl_attr_get_payload(tb[NFQA_PACKET_HDR]));
-		id = ntohl(ph->packet_id);
-
-		printf("packet received (id=%u hw=0x%04x hook=%u)\n",
-		       id, ntohs(ph->hw_protocol), ph->hook);
+	if (nfq_nlmsg_parse(nlh, attr) < 0) {
+		perror("problems parsing");
+		return MNL_CB_ERROR;
 	}
 
-	return MNL_CB_OK + id;
-}
+	nfg = static_cast<struct nfgenmsg *>(mnl_nlmsg_get_payload(nlh));
 
-static struct nlmsghdr *
-nfq_build_cfg_pf_request(char *buf, uint8_t command)
-{
-	struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type	= (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
+	if (attr[NFQA_PACKET_HDR] == NULL) {
+		fputs("metaheader not set\n", stderr);
+		return MNL_CB_ERROR;
+	}
 
-	struct nfgenmsg *nfg = static_cast<struct nfgenmsg *>(mnl_nlmsg_put_extra_header(nlh, sizeof(*nfg)));
-	nfg->nfgen_family = AF_UNSPEC;
-	nfg->version = NFNETLINK_V0;
+	ph = static_cast<struct nfqnl_msg_packet_hdr *>(mnl_attr_get_payload(attr[NFQA_PACKET_HDR]));
 
-	struct nfqnl_msg_config_cmd cmd = {
-		.command = command,
-		.pf = htons(AF_INET),
-	};
-	mnl_attr_put(nlh, NFQA_CFG_CMD, sizeof(cmd), &cmd);
+	plen = mnl_attr_get_payload_len(attr[NFQA_PAYLOAD]);
+	/* void *payload = mnl_attr_get_payload(attr[NFQA_PAYLOAD]); */
 
-	return nlh;
-}
+	skbinfo = attr[NFQA_SKB_INFO] ? ntohl(mnl_attr_get_u32(attr[NFQA_SKB_INFO])) : 0;
 
-static struct nlmsghdr *
-nfq_build_cfg_request(char *buf, uint8_t command, int queue_num)
-{
-	struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type	= (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
+	if (attr[NFQA_CAP_LEN]) {
+		uint32_t orig_len = ntohl(mnl_attr_get_u32(attr[NFQA_CAP_LEN]));
+		if (orig_len != plen)
+			printf("truncated ");
+	}
 
-	struct nfgenmsg *nfg = static_cast<struct nfgenmsg *>(mnl_nlmsg_put_extra_header(nlh, sizeof(*nfg)));
-	nfg->nfgen_family = AF_UNSPEC;
-	nfg->version = NFNETLINK_V0;
-	nfg->res_id = htons(queue_num);
+	if (skbinfo & NFQA_SKB_GSO)
+		printf("GSO ");
 
-	struct nfqnl_msg_config_cmd cmd = {
-		.command = command,
-		.pf = htons(AF_INET),
-	};
-	mnl_attr_put(nlh, NFQA_CFG_CMD, sizeof(cmd), &cmd);
+	id = ntohl(ph->packet_id);
+	printf("packet received (id=%u hw=0x%04x hook=%u, payload len %u",
+		id, ntohs(ph->hw_protocol), ph->hook, plen);
 
-	return nlh;
-}
+	/*
+	 * ip/tcp checksums are not yet valid, e.g. due to GRO/GSO.
+	 * The application should behave as if the checksums are correct.
+	 *
+	 * If these packets are later forwarded/sent out, the checksums will
+	 * be corrected by kernel/hardware.
+	 */
+	if (skbinfo & NFQA_SKB_CSUMNOTREADY)
+		printf(", checksum not ready");
+	puts(")");
 
-static struct nlmsghdr *
-nfq_build_cfg_params(char *buf, uint8_t mode, int range, int queue_num)
-{
-	struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type	= (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nfq_send_verdict(ntohs(nfg->res_id), id);
 
-	struct nfgenmsg *nfg = static_cast<struct nfgenmsg *>(mnl_nlmsg_put_extra_header(nlh, sizeof(*nfg)));
-	nfg->nfgen_family = AF_UNSPEC;
-	nfg->version = NFNETLINK_V0;
-	nfg->res_id = htons(queue_num);
-
-	struct nfqnl_msg_config_params params = {
-		.copy_range = htonl(range),
-		.copy_mode = mode,
-	};
-	mnl_attr_put(nlh, NFQA_CFG_PARAMS, sizeof(params), &params);
-
-	return nlh;
-}
-
-static struct nlmsghdr *
-nfq_build_verdict(char *buf, int id, int queue_num, int verd)
-{
-	struct nlmsghdr *nlh;
-	struct nfgenmsg *nfg;
-
-	nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type = (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_VERDICT;
-	nlh->nlmsg_flags = NLM_F_REQUEST;
-	nfg = static_cast<struct nfgenmsg *>(mnl_nlmsg_put_extra_header(nlh, sizeof(*nfg)));
-	nfg->nfgen_family = AF_UNSPEC;
-	nfg->version = NFNETLINK_V0;
-	nfg->res_id = htons(queue_num);
-
-	struct nfqnl_msg_verdict_hdr vh = {
-		.verdict = htonl(verd),
-		.id = htonl(id),
-	};
-	mnl_attr_put(nlh, NFQA_VERDICT_HDR, sizeof(vh), &vh);
-
-	return nlh;
+	return MNL_CB_OK;
 }
 
 int main(int argc, char *argv[])
 {
-	struct mnl_socket *nl;
-	char buf[MNL_SOCKET_BUFFER_SIZE];
+	char *buf;
+	/* largest possible packet payload, plus netlink data overhead: */
+	size_t sizeof_buf = 0xffff + (MNL_SOCKET_BUFFER_SIZE/2);
 	struct nlmsghdr *nlh;
 	int ret;
 	unsigned int portid, queue_num;
@@ -181,58 +129,48 @@ int main(int argc, char *argv[])
 	}
 	portid = mnl_socket_get_portid(nl);
 
-	nlh = nfq_build_cfg_pf_request(buf, NFQNL_CFG_CMD_PF_UNBIND);
+	buf = static_cast<char*>(malloc(sizeof_buf));
+	if (!buf) {
+		perror("allocate receive buffer");
+		exit(EXIT_FAILURE);
+	}
+
+	nlh = nfq_nlmsg_put(buf, NFQNL_MSG_CONFIG, queue_num);
+	nfq_nlmsg_cfg_put_cmd(nlh, AF_INET, NFQNL_CFG_CMD_BIND);
 
 	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-		perror("mnl_socket_sendto");
+		perror("mnl_socket_send");
 		exit(EXIT_FAILURE);
 	}
 
-	nlh = nfq_build_cfg_pf_request(buf, NFQNL_CFG_CMD_PF_BIND);
+	nlh = nfq_nlmsg_put(buf, NFQNL_MSG_CONFIG, queue_num);
+	nfq_nlmsg_cfg_put_params(nlh, NFQNL_COPY_PACKET, 0xffff);
+
+	mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_GSO));
+	mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_GSO));
 
 	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-		perror("mnl_socket_sendto");
+		perror("mnl_socket_send");
 		exit(EXIT_FAILURE);
 	}
 
-	nlh = nfq_build_cfg_request(buf, NFQNL_CFG_CMD_BIND, queue_num);
+	/* ENOBUFS is signalled to userspace when packets were lost
+	 * on kernel side.  In most cases, userspace isn't interested
+	 * in this information, so turn it off.
+	 */
+	ret = 1;
+	mnl_socket_setsockopt(nl, NETLINK_NO_ENOBUFS, &ret, sizeof(int));
 
-	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-		perror("mnl_socket_sendto");
-		exit(EXIT_FAILURE);
-	}
-
-	nlh = nfq_build_cfg_params(buf, NFQNL_COPY_PACKET, 0xFFFF, queue_num);
-
-	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-		perror("mnl_socket_sendto");
-		exit(EXIT_FAILURE);
-	}
-
-	ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
-	if (ret == -1) {
-		perror("mnl_socket_recvfrom");
-		exit(EXIT_FAILURE);
-	}
-	while (ret > 0) {
-		uint32_t id;
+	for (;;) {
+		ret = mnl_socket_recvfrom(nl, buf, sizeof_buf);
+		if (ret == -1) {
+			perror("mnl_socket_recvfrom");
+			exit(EXIT_FAILURE);
+		}
 
 		ret = mnl_cb_run(buf, ret, 0, portid, queue_cb, NULL);
 		if (ret < 0){
 			perror("mnl_cb_run");
-			exit(EXIT_FAILURE);
-		}
-
-		id = ret - MNL_CB_OK;
-		nlh = nfq_build_verdict(buf, id, queue_num, NF_ACCEPT);
-		if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-			perror("mnl_socket_sendto");
-			exit(EXIT_FAILURE);
-		}
-
-		ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
-		if (ret == -1) {
-			perror("mnl_socket_recvfrom");
 			exit(EXIT_FAILURE);
 		}
 	}
